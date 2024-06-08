@@ -11,13 +11,22 @@ var avrdudeIsRunning = false;
 
 function createWindow () {
   // Create the browser window.
+  windowWidth = 1024;
+  windowHeight = 700;
+  if(process.platform == "win32") 
+  {
+    windowWidth = 1037;
+    windowHeight = 725;
+  }
+
   win = new BrowserWindow({
-    width: 1024,
-    height: 700, 
+    width: windowWidth,
+    height: windowHeight, 
     backgroundColor: '#312450', 
     webPreferences: {
       contextIsolation: false,
       nodeIntegration: true,
+      backgroundThrottling: false,
     },
   });
 
@@ -43,6 +52,14 @@ function createWindow () {
     // when you should delete the corresponding element.
     win = null
   })
+
+  // Open links in external browser
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith('https:')) {
+      require('electron').shell.openExternal(url);
+    }
+    return { action: 'deny' };
+  });
 }
 
 app.allowRendererProcessReuse = false;
@@ -106,24 +123,28 @@ ipcMain.on('uploadFW', (e, args) => {
   var configName = executableName + ".conf";
   if(process.platform == "win32") { executableName = executableName + '.exe'; } //This must come after the configName line above
 
-  var firmwareFile = __dirname + "/firmwares/m328p.hex";
+  //var firmwareFile = __dirname + "/firmwares/m328p.hex";
+  var firmwareFile = __dirname + "/firmwares/nano.hex";
   firmwareFile = firmwareFile.replace('app.asar',''); //This is important for allowing the binary to be found once the app is packaed into an asar
 
   var hexFile = 'flash:w:' + firmwareFile + ':i';
 
-  var execArgs = ['-v', '-pm328p', '-C', configName, '-carduino', '-b 57600', '-P', args.port, '-D', '-U', hexFile];
+  //var execArgs = ['-v', '-pm328p', '-C', configName, '-carduino', '-b 57600', '-P', args.port, '-D', '-U', hexFile];
+  var execArgs = ['-v', '-patmega328p', '-C', configName, '-carduino', '-b 115200', '-D', '-P', args.port, '-D', '-U', hexFile];
+  var execArgs_old = ['-v', '-patmega328p', '-C', configName, '-carduino', '-b 57600', '-D', '-P', args.port, '-D', '-U', hexFile];
 
   console.log(executableName);
   //const child = spawn(executableName, execArgs);
   const child = execFile(executableName, execArgs);
+  var child_oldbootloader;
 
-  child.stdout.on('data', (data) => {
-    console.log(`avrdude stdout:\n${data}`);
-  });
+  function logAvrdudeStdout(data) { console.log(`avrdude stdout:\n${data}`); }
+  child.stdout.on('data', (data) => { logAvrdudeStdout(data); });
+  
 
-  child.stderr.on('data', (data) => {
-    console.log(`avrdude stderr: ${data}`);
-    avrdudeErr = avrdudeErr + data;
+  function logAvrdudeStderr(data) 
+  { 
+    console.log(`avrdude stderr: ${data}`); 
 
     //Check if avrdude has started the actual burn yet, and if so, track the '#' characters that it prints. Each '#' represents 1% of the total burn process (50 for write and 50 for read)
     if (burnStarted == true)
@@ -134,12 +155,53 @@ ipcMain.on('uploadFW', (e, args) => {
     else
     {
       //This is a hack, but basically watch the output from avrdude for the term 'Writing | ', everything after that is the #s indicating 1% of burn. 
-      if(avrdudeErr.substr(avrdudeErr.length - 10) == "Writing | ")
+      if(data.substr(data.length - 10) == "Writing | ")
       {
         burnStarted = true;
       }
     }
-    
+  }
+
+  function onChildExit(code, attemptNum)
+  {
+    avrdudeIsRunning = false;
+    if (code !== 0) 
+    {
+      if(attemptNum !== 0)
+      {
+        console.log(`avrdude process exited with code ${code}`);
+        e.sender.send( "upload error", avrdudeErr );
+        avrdudeErr = "";
+      }
+      else
+      {
+        console.log(`1st attempt with avrdude process exited with code ${code}. Will retry for old bootloader`);
+      }
+    }
+    else
+    {
+      e.sender.send( "upload completed", code );
+    }
+  }
+
+  child.stderr.on('data', (data) => 
+  {
+    avrdudeErr = avrdudeErr + data;
+
+    //This is a hack to try and detect old nano bootloader vs new. There does not seem to be a 'nice' way to do this that I can find. 
+    if(data.includes("resp=0x00") || data.includes("resp=0x01"))
+    {
+      avrdudeRetry = true;
+      child.kill();
+      console.log("Burn failed. Retrying for old bootloader.");
+      child_oldbootloader = execFile(executableName, execArgs_old);
+      e.sender.send( "old bootloader")
+      child_oldbootloader.stdout.on('data', (data) => { logAvrdudeStdout(data); });
+      child_oldbootloader.stderr.on('data', (data) => { logAvrdudeStderr(data); });
+      child_oldbootloader.on('close', (code) => { onChildExit(code, 1); });
+      //avrdudeRetry = false;
+    }
+    logAvrdudeStderr(data);
   });
 
   child.on('error', (err) => {
@@ -148,19 +210,7 @@ ipcMain.on('uploadFW', (e, args) => {
     avrdudeIsRunning = false;
   });
 
-  child.on('close', (code) => {
-    avrdudeIsRunning = false;
-    if (code !== 0) 
-    {
-      console.log(`avrdude process exited with code ${code}`);
-      e.sender.send( "upload error", avrdudeErr )
-      avrdudeErr = "";
-    }
-    else
-    {
-      e.sender.send( "upload completed", code )
-    }
-  });
+  child.on('close', (code) => { onChildExit(code, 0); });
 });
 
 // In this file you can include the rest of your app's specific main process

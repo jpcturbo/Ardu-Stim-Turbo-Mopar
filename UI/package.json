@@ -1,6 +1,6 @@
 {
   "name": "Ardu-Stim",
-  "version": "0.0.4",
+  "version": "1.2.1",
   "description": "Ardu-Stim engine simulator - Speeduino Version",
   "main": "main.js",
   "scripts": {
@@ -8,8 +8,10 @@
     "start": "electron .",
     "install": "electron-rebuild -f",
     "package-mac": "electron-builder --mac",
+    "package-mac-workflow": "electron-builder --publish never --mac",
     "package-win": "electron-builder --win",
     "package-linux": "electron-builder --linux",
+    "package-linux-workflow": "electron-builder --publish never --linux",
     "package-arm": "electron-builder --linux --arch=armv7l"
   },
   "repository": {
@@ -21,16 +23,16 @@
     "email": "sales@speeduino.com",
     "url": "https://speeduino.com"
   },
-  "license": "ISC",
+  "license": "GPL v3",
   "bugs": {
     "url": "https://github.com/speeduino/Ardu-Stim/Issues"
   },
   "homepage": "https://github.com/speeduino/Ardu-Stim",
   "devDependencies": {
+    "@electron/packager": "^18.3.2",
     "@electron/rebuild": "^3.6.0",
-    "electron": "^22.3.25",
-    "electron-builder": "^24.13.3",
-    "electron-packager": "^17.1.2"
+    "electron": "^30.0.8",
+    "electron-builder": "^24.13.3"
   },
   "dependencies": {
     "semver": "^7.3.5",

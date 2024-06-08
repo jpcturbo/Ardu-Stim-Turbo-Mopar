@@ -19,47 +19,42 @@
  *
  */
 
-#include "defines.h"
+#include "globals.h"
 #include "ardustim.h"
 #include "enums.h"
 #include "comms.h"
 #include "storage.h"
-#include "user_defaults.h"
 #include "wheel_defs.h"
 #include <avr/pgmspace.h>
 #include <EEPROM.h>
 
+struct configTable config;
+struct status currentStatus;
+
 /* Sensistive stuff used in ISR's */
-volatile uint8_t fraction = 0;
 volatile uint16_t adc0; /* POT RPM */
 volatile uint16_t adc1; /* Pot Wheel select */
-volatile uint32_t oc_remainder = 0;
 /* Setting rpm to any value over 0 will enabled sweeping by default */
 /* Stuff for handling prescaler changes (small tooth wheels are low RPM) */
 volatile uint8_t analog_port = 0;
 volatile bool adc0_read_complete = false;
 volatile bool adc1_read_complete = false;
 volatile bool reset_prescaler = false;
-volatile bool normal = true;
-volatile bool sweep_reset_prescaler = true; /* Force sweep to reset prescaler value */
-volatile bool sweep_lock = false;
 volatile uint8_t output_invert_mask = 0x00; /* Don't invert anything */
-volatile uint8_t sweep_direction = ASCENDING;
-volatile byte total_sweep_stages = 0;
-volatile uint8_t sweep_stage = 0;
 volatile uint8_t prescaler_bits = 0;
 volatile uint8_t last_prescaler_bits = 0;
-volatile uint8_t mode = 0;
 volatile uint16_t new_OCR1A = 5000; /* sane default */
 volatile uint16_t edge_counter = 0;
+volatile uint32_t cycleStartTime = micros();
+volatile uint32_t cycleDuration = 0;
+uint32_t sweep_time_counter = 0;
+uint8_t sweep_direction = ASCENDING;
 
 /* Less sensitive globals */
 uint8_t bitshift = 0;
-uint16_t sweep_low_rpm = 250;
-uint16_t sweep_high_rpm = 4000;
-uint16_t sweep_rate = 1;                               
 
-sweep_step *SweepSteps;  /* Global pointer for the sweep steps */
+
+
 
 wheels Wheels[MAX_WHEELS] = {
    /* Pointer to friendly name string, pointer to edge array, RPM Scaler, Number of edges in the array, whether the number of edges covers 360 or 720 degrees */
@@ -124,14 +119,15 @@ wheels Wheels[MAX_WHEELS] = {
   { Jeep_2000_friendly_name, jeep_2000, 1.5, 360, 720},
   { BMW_N20_friendly_name, bmw_n20, 1.0, 240, 720},
   { VIPER9602_friendly_name, viper9602wheel, 1.0, 240, 720},
+  { thirty_six_minus_two_with_second_trigger_friendly_name, thirty_six_minus_two_with_second_trigger, 0.6, 144, 720 },
   { Turbo_Mopar_MPSpeeduino_LM_SMEC_name, turbo_mopar_mpspeeduino_lm_smec, 3, 720, 720},
   { Turbo_Mopar_SBEC_name, turbo_mopar_sbec, 3, 720, 720}
 };
 
 /* Initialization */
 void setup() {
-  serialSetup();
   loadConfig();
+  serialSetup();
 
   cli(); // stop interrupts
 
@@ -164,7 +160,7 @@ void setup() {
   // Set prescaler to x64
   TCCR2B |= (1 << CS22); /* Prescaler of 64 */
   // Enable output compare interrupt for timer channel 2
-  TIMSK2 |= (1 << OCIE2A);
+  //TIMSK2 |= (1 << OCIE2A); //Disabled as no longer using TIMER2 for sweep
 
 
   /* Configure ADC as per http://www.glennsweeney.com/tutorials/interrupt-driven-analog-conversion-with-an-atmega328p */
@@ -222,7 +218,7 @@ void setup() {
   // Set ADSC in ADCSRA (0x7A) to start the ADC conversion
   ADCSRA |= B01000000;
   /* Make sure we are using the DEFAULT RPM on startup */
-  reset_new_OCR1A(wanted_rpm); 
+  reset_new_OCR1A(currentStatus.rpm); 
 
 } // End setup
 
@@ -258,135 +254,20 @@ ISR(ADC_vect){
 //  }
 }
 
-
-/* This is the "low speed" 1000x/second sweeper interrupt routine
- * who's sole purpose in life is to reset the output compare value
- * for timer zero to change the output RPM.  In cases where the RPM
- * change per ISR is LESS than one LSB of the counter a set of modulus
- * variabels are used to handle fractional values.
- */
-ISR(TIMER2_COMPA_vect) {
-//  PORTD = (1 << 7);
-  if ( mode != LINEAR_SWEPT_RPM)
-  {
-//    PORTD = (0 << 7);
-    return;
-  }
-  if (sweep_lock)  // semaphore to protect around changes/critical sections
-  {  
- //   PORTD = (0 << 7);
-    return;
-  }
-  sweep_lock = true;
-  if (sweep_reset_prescaler)
-  {
-    sweep_reset_prescaler = false;
-    reset_prescaler = true;
-    prescaler_bits = SweepSteps[sweep_stage].prescaler_bits;
-    last_prescaler_bits = prescaler_bits;  
-  }
-  /* Sweep code */
-  if (sweep_direction == ASCENDING)
-  {
-    oc_remainder += SweepSteps[sweep_stage].remainder_per_isr;
-    /* IF the total is over the threshold we increment the TCNT factor
-     * for each multiple it is over by
-     */
-    while (oc_remainder > FACTOR_THRESHOLD)
-    {
-      fraction++;
-      oc_remainder -= FACTOR_THRESHOLD;
-    }
-    if (new_OCR1A > SweepSteps[sweep_stage].ending_ocr)
-    {
-      new_OCR1A -= (SweepSteps[sweep_stage].tcnt_per_isr + fraction);
-      fraction = 0;
-    }
-    else /* END of the stage, find out where we are */
-    {
-      sweep_stage++;
-      oc_remainder = 0;
-      if (sweep_stage < total_sweep_stages)
-      {
-        /* Toggle  when changing stages */
-        //PORTD &= ~(1<<7); /* turn DBG pin off */
-        //PORTD |= (1<<7);  /* Turn DBG pin on */
-        new_OCR1A = SweepSteps[sweep_stage].beginning_ocr;
-        if (SweepSteps[sweep_stage].prescaler_bits != last_prescaler_bits)
-          sweep_reset_prescaler = true;
-      }
-      else /* END of line, time to reverse direction */
-      {
-        sweep_stage--; /*Bring back within limits */
-        sweep_direction = DESCENDING;
-        new_OCR1A = SweepSteps[sweep_stage].ending_ocr;
-        if (SweepSteps[sweep_stage].prescaler_bits != last_prescaler_bits)
-          sweep_reset_prescaler = true;
-        PORTD |= 1 << 7;  /* Debugginga, ascending */
-      }
-      /* Reset fractionals or next round */
-    }
-  }
-  else /* Descending */
-  {
-    oc_remainder += SweepSteps[sweep_stage].remainder_per_isr;
-    while (oc_remainder > FACTOR_THRESHOLD)
-    {
-      fraction++;
-      oc_remainder -= FACTOR_THRESHOLD;
-    }
-    if (new_OCR1A < SweepSteps[sweep_stage].beginning_ocr)
-    {
-      new_OCR1A += (SweepSteps[sweep_stage].tcnt_per_isr + fraction);
-      fraction = 0;
-    }
-    else /* End of stage */
-    {
-      sweep_stage--;
-      oc_remainder = 0;
-      if (sweep_stage >= 0)
-      {
-        new_OCR1A = SweepSteps[sweep_stage].ending_ocr;
-        if (SweepSteps[sweep_stage].prescaler_bits != last_prescaler_bits)
-          sweep_reset_prescaler = true;
-      }
-      else /*End of the line */
-      {
-        sweep_stage++; /*Bring back within limits */
-        sweep_direction = ASCENDING;
-        new_OCR1A = SweepSteps[sweep_stage].beginning_ocr;
-        if (SweepSteps[sweep_stage].prescaler_bits != last_prescaler_bits)
-          sweep_reset_prescaler = true;
-        PORTD &= ~(1<<7);  /*Descending  turn pin off */
-      }
-    }
-  }
-  sweep_lock = false;
-  //wanted_rpm = get_rpm_from_tcnt(&SweepSteps[sweep_stage].beginning_ocr, &SweepSteps[sweep_stage].prescaler_bits);
-//  PORTD = (0 << 7);
-}
-
 /* Pumps the pattern out of flash to the port 
  * The rate at which this runs is dependent on what OCR1A is set to
- * the sweeper in timer2 alters this on the fly to alow changing of RPM
- * in a very nice way
  */
-ISR(TIMER1_COMPA_vect) {
+ISR(TIMER1_COMPA_vect) 
+{
   /* This is VERY simple, just walk the array and wrap when we hit the limit */
-  PORTB = output_invert_mask ^ pgm_read_byte(&Wheels[selected_wheel].edge_states_ptr[edge_counter]);   /* Write it to the port */
-  /* Normal direction  overflow handling */
-  if (normal)
+  PORTB = output_invert_mask ^ pgm_read_byte(&Wheels[config.wheel].edge_states_ptr[edge_counter]);   /* Write it to the port */
+  
+  edge_counter++;
+  if (edge_counter == Wheels[config.wheel].wheel_max_edges) 
   {
-    edge_counter++;
-    if (edge_counter == Wheels[selected_wheel].wheel_max_edges) {
-      edge_counter = 0;
-    }
-  }
-  else
-  {
-    if (edge_counter == 0)
-      edge_counter = Wheels[selected_wheel].wheel_max_edges;
-    edge_counter--;
+    edge_counter = 0;
+    cycleDuration = micros() - cycleStartTime;
+    cycleStartTime = micros();
   }
   /* The tables are in flash so we need pgm_read_byte() */
 
@@ -403,26 +284,119 @@ ISR(TIMER1_COMPA_vect) {
 
 void loop() 
 {
-  uint16_t tmp_rpm = 0;
+  uint16_t tmp_rpm = currentStatus.base_rpm;
   /* Just handle the Serial UI, everything else is in 
    * interrupt handlers or callbacks from SerialUI.
    */
-
-
   if(Serial.available() > 0) { commandParser(); }
 
-  if(mode == POT_RPM)
+  if(config.mode == POT_RPM)
   {
     if (adc0_read_complete == true)
     {
       adc0_read_complete = false;
       tmp_rpm = adc0 << TMP_RPM_SHIFT;
       if (tmp_rpm > TMP_RPM_CAP) { tmp_rpm = TMP_RPM_CAP; }
-      wanted_rpm = tmp_rpm;
-      reset_new_OCR1A(tmp_rpm);
     }
   }
+  else if (config.mode == LINEAR_SWEPT_RPM)
+  {
+    
+    if(micros() > (sweep_time_counter + config.sweep_interval))
+    {
+      sweep_time_counter = micros();
+      if(sweep_direction == ASCENDING)
+      {
+        tmp_rpm = currentStatus.base_rpm + 1;
+        if(tmp_rpm >= config.sweep_high_rpm) { sweep_direction = DESCENDING; }
+      }
+      else
+      {
+        tmp_rpm = currentStatus.base_rpm - 1;
+        if(tmp_rpm <= config.sweep_low_rpm) { sweep_direction = ASCENDING; }
+      }
+    }
+    
+  }
+  else if (config.mode == FIXED_RPM)
+  {
+    tmp_rpm = config.fixed_rpm;
+  }
+  currentStatus.base_rpm = tmp_rpm;
 
+  currentStatus.compressionModifier = calculateCompressionModifier();
+  if(currentStatus.compressionModifier >= currentStatus.base_rpm ) { currentStatus.compressionModifier = 0; }
+
+  setRPM( (currentStatus.base_rpm - currentStatus.compressionModifier) );
+}
+
+uint16_t calculateCompressionModifier()
+{
+  if( (currentStatus.base_rpm > config.compressionRPM) || (config.useCompression != true) ) { return 0; }
+  //if( currentStatus.base_rpm > 400 ) { return 0;}
+
+  uint16_t crankAngle = calculateCurrentCrankAngle();
+  uint16_t modAngle = crankAngle;
+
+  uint16_t compressionModifier = 0;
+  switch(config.compressionType)
+  {
+    case COMPRESSION_TYPE_2CYL_4STROKE:
+      modAngle = crankAngle / 2;
+      compressionModifier = pgm_read_byte(&sin_100_180[modAngle]);
+      break;
+    case COMPRESSION_TYPE_4CYL_4STROKE:
+      modAngle = (crankAngle % 180) ;
+      compressionModifier = pgm_read_byte(&sin_100_180[modAngle]);
+      break;
+    case COMPRESSION_TYPE_6CYL_4STROKE:
+      modAngle = crankAngle % 120;
+      compressionModifier = pgm_read_byte(&sin_100_120[modAngle]);
+      break;
+    case COMPRESSION_TYPE_8CYL_4STROKE:
+      modAngle = crankAngle % 90;
+      compressionModifier = pgm_read_byte(&sin_100_90[modAngle]);
+      break;
+    default:
+      modAngle = (crankAngle % 180) ;
+      compressionModifier = pgm_read_byte(&sin_100_180[modAngle]);
+      break;
+  }
+
+  //RPM scaler - Varies the amplitude of the compression modifier based on how far below the compression RPM point we are. Eg:
+  //If the compression RPM value is 400
+  //At 300rpm the amplitude will be 75%
+  //At 200rpm the amplitude will be 50%
+  //At 100rpm the amplitude will be 25% etc
+  //Base RPM must be below 650 to prevent overflow
+  if(config.compressionDynamic && (currentStatus.base_rpm < 655U) ) { compressionModifier = (compressionModifier * currentStatus.base_rpm) / config.compressionRPM; }
+  
+  return compressionModifier;
+}
+
+uint16_t calculateCurrentCrankAngle()
+{
+  if(cycleDuration == 0) { return 0; }
+
+  uint32_t cycleTime = micros() - cycleStartTime;
+  if( Wheels[config.wheel].wheel_degrees == 720 ) { cycleTime = cycleTime * 2; } 
+  
+  uint16_t tmpCrankAngle = ((cycleTime * 360U) / cycleDuration);
+  tmpCrankAngle += config.compressionOffset;
+  while(tmpCrankAngle > 360) { tmpCrankAngle -= 360; }
+
+  return tmpCrankAngle;
+}
+
+/*!
+ * Validates the new user requested RPM and sets it if valid. 
+ */ 
+void setRPM(uint16_t newRPM)
+{
+  if (newRPM < 10)  { return; }
+
+  if(currentStatus.rpm != newRPM) { reset_new_OCR1A( newRPM ); }
+  currentStatus.rpm = newRPM;
 }
 
 
@@ -431,15 +405,12 @@ void reset_new_OCR1A(uint32_t new_rpm)
   uint32_t tmp;
   uint8_t bitshift;
   uint8_t tmp_prescaler_bits;
-  tmp = (uint32_t)(8000000.0/(Wheels[selected_wheel].rpm_scaler * (float)(new_rpm < 10 ? 10:new_rpm)));
-/*  mySUI.print(F("new_OCR1a: "));
-  mySUI.println(tmpl);
-  */
+  tmp = (uint32_t)(8000000.0/(Wheels[config.wheel].rpm_scaler * (float)(new_rpm < 10 ? 10:new_rpm)));
+  //tmp = (uint32_t)(8000000/(Wheels[config.wheel].rpm_scaler * (new_rpm < 10 ? 10:new_rpm)));
+  //uint64_t x = 800000000000ULL;
+
   get_prescaler_bits(&tmp,&tmp_prescaler_bits,&bitshift);
-  /*
-  mySUI.print(F("new_OCR1a: "));
-  mySUI.println(tmp2);
-  */
+
   new_OCR1A = (uint16_t)(tmp >> bitshift); 
   prescaler_bits = tmp_prescaler_bits;
   reset_prescaler = true; 
@@ -463,20 +434,6 @@ uint8_t get_bitshift_from_prescaler(uint8_t *prescaler_bits)
   }
   return 0;
 }
-
-
-//! Gets RPM from the TCNT value
-/*!
- * Gets the RPM value based on the passed TCNT and prescaler
- * \param tcnt pointer to Output Compare register value
- * \param prescaler_bits point to prescaler bits enum
- */
-uint16_t get_rpm_from_tcnt(uint16_t *tcnt, uint8_t *prescaler_bits)
-{
-  bitshift = get_bitshift_from_prescaler(prescaler_bits);
-  return (uint16_t)((float)(8000000 >> bitshift)/(Wheels[selected_wheel].rpm_scaler*(*tcnt)));
-}
-
 
 //! Gets prescaler enum and bitshift based on OC value
 void get_prescaler_bits(uint32_t *potential_oc_value, uint8_t *prescaler, uint8_t *bitshift)
@@ -506,59 +463,4 @@ void get_prescaler_bits(uint32_t *potential_oc_value, uint8_t *prescaler, uint8_
     *prescaler = PRESCALE_1;
     *bitshift = 0;
   }
-}
-
-
-//! Builds the SweepSteps[] structure
-/*!
- * For sweeping we cannot just pick the TCNT value at the beginning and ending
- * and sweep linearily between them as it'll result in a VERY slow RPM change
- * at the low end and a VERY FAST change at the high end due to the inverse
- * relationship between RPM and TCNT. So we compromise and break up the RPM
- * range into octaves (doubles of RPM), and use a linear TCNT change between
- * those two points. It's not perfect, but computationally easy
- *
- * \param low_rpm_tcnt pointer to low rpm OC value, (not prescaled!)
- * \param high_rpm_tcnt pointer to low rpm OC value, (not prescaled!)
- * \param total_stages pointer to tell the number of structs to allocate
- * \returns pointer to array of structures for each sweep stage.
- */
-sweep_step *build_sweep_steps(uint32_t *low_rpm_tcnt, uint32_t *high_rpm_tcnt, uint8_t *total_stages)
-{
-  sweep_step *steps;
-  uint8_t prescaler_bits;
-  uint8_t bitshift;
-  uint32_t tmp = *low_rpm_tcnt;
-  /* DEBUG
-  mySUI.print(*low_rpm_tcnt);
-  mySUI.print(F("<->"));
-  mySUI.println(*high_rpm_tcnt);
-   */
-
-  steps = (sweep_step *)malloc(sizeof(sweep_step)*(*total_stages));
-
-#ifdef MORE_LINEAR_SWEEP
-  for (uint8_t i = 0; i < (*total_stages); i+=2)
-#else
-  for (uint8_t i = 0; i < (*total_stages); i++)
-#endif
-  {
-    /* The low rpm value will ALWAYS have the highed TCNT value so use that
-    to determine the prescaler value
-    */
-    get_prescaler_bits(&tmp, &steps[i].prescaler_bits, &bitshift);
-    
-    steps[i].beginning_ocr = (uint16_t)(tmp >> bitshift);
-    if ((tmp >> 1) < (*high_rpm_tcnt))
-      steps[i].ending_ocr = (uint16_t)((*high_rpm_tcnt) >> bitshift);
-    else
-      steps[i].ending_ocr = (uint16_t)(tmp >> (bitshift + 1)); // Half the begin value
-    tmp = tmp >> 1; /* Divide by 2 */
-    /* DEBUG
-    mySUI.print(steps[i].beginning_ocr);
-    mySUI.print(F("<->"));
-    mySUI.println(steps[i].ending_ocr);
-    */
-  }
-  return steps;
 }
